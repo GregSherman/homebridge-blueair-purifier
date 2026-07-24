@@ -161,31 +161,82 @@ export default class BlueAirAwsApi {
       throw new Error('getDeviceStatus error: no deviceInfo in response');
     }
 
-    const deviceStatuses: BlueAirDeviceStatus[] = data.deviceInfo.map((device) => {
-      return {
-        id: device.id,
-        name: device.configuration.di.name,
-        sensorData: device.sensordata.reduce((acc, sensor) => {
+    const deviceStatuses: BlueAirDeviceStatus[] = await Promise.all(
+      data.deviceInfo.map(async (device) => {
+        let sensorData = device.sensordata.reduce((acc, sensor) => {
           const key = BlueAirDeviceSensorDataMap[sensor.n];
           if (key) {
             acc[key] = sensor.v;
           }
           return acc;
-        }, {} as BlueAirDeviceSensorData),
-        state: device.states.reduce((acc, state) => {
-          if (state.v !== undefined) {
-            acc[state.n] = state.v;
-          } else if (state.vb !== undefined) {
-            acc[state.n] = state.vb;
-          } else {
-            this.logger.warn(`getDeviceStatus: unknown state ${JSON.stringify(state)}`);
+        }, {} as BlueAirDeviceSensorData);
+
+        // Fallback: /r/initial returned no sensor data for this device —
+        // pull it from the telemetry history endpoint instead.
+        if (Object.keys(sensorData).length === 0) {
+          try {
+            sensorData = await this.getDeviceSensorHistory(device.id);
+          } catch (err) {
+            this.logger.warn(`Failed to fetch telemetry fallback for ${device.id}: ${err}`);
           }
-          return acc;
-        }, {} as BlueAirDeviceState),
-      };
-    });
+        }
+
+        return {
+          id: device.id,
+          name: device.configuration.di.name,
+          sensorData,
+          state: device.states.reduce((acc, state) => {
+            if (state.v !== undefined) {
+              acc[state.n] = state.v;
+            } else if (state.vb !== undefined) {
+              acc[state.n] = state.vb;
+            } else {
+              this.logger.warn(`getDeviceStatus: unknown state ${JSON.stringify(state)}`);
+            }
+            return acc;
+          }, {} as BlueAirDeviceState),
+        };
+      }),
+    );
 
     return deviceStatuses;
+
+    return deviceStatuses;
+  }
+
+  async getDeviceSensorHistory(uuid: string, hoursBack = 0.1): Promise<BlueAirDeviceSensorData> {
+    await this.checkTokenExpiration();
+
+    const now = Math.floor(Date.now() / 1000);
+    const from = now - hoursBack * 3600;
+
+    const params = new URLSearchParams({
+      did: uuid,
+      from: from.toString(),
+      to: now.toString(),
+    });
+    ['pm1', 'pm2_5', 'pm10', 'tVOC', 'hcho', 'h', 't', 'fsp0'].forEach((s) => params.append('s', s));
+
+    const data = await this.apiCall(`/${this.userId}/r/telemetry/5m/historical?${params.toString()}`, undefined, 'GET');
+
+    const sensorData: BlueAirDeviceSensorData = {};
+    const entry = Array.isArray(data) ? data[0] : undefined;
+    if (!entry || !Array.isArray(entry.sensors) || !Array.isArray(entry.datapoints) || entry.datapoints.length === 0) {
+      return sensorData;
+    }
+
+    const sensorNames: string[] = entry.sensors;
+    const latestRow: (string | null)[] = entry.datapoints[entry.datapoints.length - 1];
+
+    sensorNames.forEach((name, i) => {
+      const rawValue = latestRow[i + 1]; // +1 to skip the timestamp column
+      const key = BlueAirDeviceSensorDataMap[name];
+      if (key && rawValue !== null && rawValue !== undefined) {
+        sensorData[key] = parseFloat(rawValue as string);
+      }
+    });
+
+    return sensorData;
   }
 
   async setDeviceStatus(uuid: string, state: string, value: number | boolean): Promise<void> {
