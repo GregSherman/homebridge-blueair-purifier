@@ -82,6 +82,9 @@ export default class BlueAirAwsApi {
   private idToken: string;
   private userId: string;
   private blueAirApiUrl: string;
+  mqttAuthName: string;
+  mqttAuthSignature: string;
+  mqttAuthToken: string;
 
   constructor(
     username: string,
@@ -104,6 +107,9 @@ export default class BlueAirAwsApi {
     this.accessToken = '';
     this.idToken = '';
     this.userId = '';
+    this.mqttAuthName = '';
+    this.mqttAuthSignature = '';
+    this.mqttAuthToken = '';
   }
 
   async login(): Promise<void> {
@@ -111,12 +117,21 @@ export default class BlueAirAwsApi {
 
     const { token, secret } = await this.gigyaApi.getGigyaSession();
     const { jwt } = await this.gigyaApi.getGigyaJWT(token, secret);
-    const { accessToken, idToken, userId } = await this.getAwsAccessToken(jwt);
+    const { accessToken, idToken, userId, mqttAuthName, mqttAuthSignature, mqttAuthToken } = await this.getAwsAccessToken(jwt);
 
     this.last_login = Date.now();
     this.accessToken = accessToken;
     this.idToken = idToken;
     this.userId = userId;
+    this.mqttAuthName = mqttAuthName ?? '';
+    this.mqttAuthSignature = mqttAuthSignature ?? '';
+    this.mqttAuthToken = mqttAuthToken ?? '';
+
+    if (this.mqttAuthName && this.mqttAuthSignature && this.mqttAuthToken) {
+      this.logger.debug('MQTT credentials obtained');
+    } else {
+      this.logger.warn('MQTT credentials missing from login response — real-time sensor data will not be available');
+    }
 
     this.logger.debug('Logged in');
   }
@@ -127,6 +142,15 @@ export default class BlueAirAwsApi {
       return await this.login();
     }
     return;
+  }
+
+  getMqttCredentials(): { authName: string; authSignature: string; authToken: string; userId: string } {
+    return {
+      authName: this.mqttAuthName,
+      authSignature: this.mqttAuthSignature,
+      authToken: this.mqttAuthToken,
+      userId: this.userId,
+    };
   }
 
   async getDevices(): Promise<BlueAirDeviceDiscovery[]> {
@@ -144,7 +168,7 @@ export default class BlueAirAwsApi {
     return devices;
   }
 
-  async getDeviceStatus(accountUuid: string, uuids: string[]): Promise<BlueAirDeviceStatus[]> {
+  async getDeviceStatus(accountUuid: string, uuids: string[], allowTelemetryFallback = false): Promise<BlueAirDeviceStatus[]> {
     await this.checkTokenExpiration();
 
     const body = {
@@ -173,7 +197,7 @@ export default class BlueAirAwsApi {
 
         // Fallback: /r/initial returned no sensor data for this device —
         // pull it from the telemetry history endpoint instead.
-        if (Object.keys(sensorData).length === 0) {
+        if (Object.keys(sensorData).length === 0 && allowTelemetryFallback) {
           try {
             sensorData = await this.getDeviceSensorHistory(device.id);
           } catch (err) {
@@ -261,7 +285,14 @@ export default class BlueAirAwsApi {
     // this.logger.debug(`setDeviceStatus response: ${JSON.stringify(response)}`);
   }
 
-  private async getAwsAccessToken(jwt: string): Promise<{ accessToken: string; idToken: string; userId: string }> {
+  private async getAwsAccessToken(jwt: string): Promise<{
+    accessToken: string;
+    idToken: string;
+    userId: string;
+    mqttAuthName?: string;
+    mqttAuthSignature?: string;
+    mqttAuthToken?: string;
+  }> {
     this.logger.debug('Getting AWS access token...');
 
     const response = await this.apiCall('/login', undefined, 'POST', {
@@ -283,6 +314,9 @@ export default class BlueAirAwsApi {
       accessToken,
       idToken: response.id_token ?? jwt,
       userId: tokenPayload.username ?? '',
+      mqttAuthName: response['ba_X-Amz-CustomAuthorizer-Name'],
+      mqttAuthSignature: response['ba_X-Amz-CustomAuthorizer-Signature'],
+      mqttAuthToken: response['ba_X-Amz-CustomAuthorizer-Token'],
     };
   }
 

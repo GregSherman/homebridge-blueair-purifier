@@ -4,6 +4,7 @@ import { PLATFORM_NAME, PLUGIN_NAME } from './settings';
 import { Config, defaultConfig } from './platformUtils';
 import { defaultsDeep } from 'lodash';
 import BlueAirAwsApi, { BlueAirDeviceStatus } from './api/BlueAirAwsApi';
+import BlueAirMqttClient from './api/BlueAirMqttClient';
 import { BlueAirDevice } from './device/BlueAirDevice';
 import { AirPurifierAccessory } from './accessory/AirPurifierAccessory';
 import EventEmitter from 'events';
@@ -22,6 +23,7 @@ export class BlueAirPlatform extends EventEmitter implements DynamicPlatformPlug
 
   private devices: BlueAirDevice[] = [];
   private polling: NodeJS.Timeout | null = null;
+  private mqttClient?: BlueAirMqttClient;
 
   constructor(
     public readonly log: Logger,
@@ -52,8 +54,12 @@ export class BlueAirPlatform extends EventEmitter implements DynamicPlatformPlug
 
     this.api.on('didFinishLaunching', async () => {
       await this.getInitialDeviceStates();
-
       this.getValidDevicesStatus();
+      this.startMqtt();
+    });
+
+    this.api.on('shutdown', () => {
+      this.mqttClient?.disconnect();
     });
   }
 
@@ -90,7 +96,7 @@ export class BlueAirPlatform extends EventEmitter implements DynamicPlatformPlug
     try {
       await this.blueAirApi.login();
       let uuids = this.platformConfig.devices.map((device) => device.id);
-      const devices = await this.blueAirApi.getDeviceStatus(this.platformConfig.accountUuid, uuids);
+      const devices = await this.blueAirApi.getDeviceStatus(this.platformConfig.accountUuid, uuids, true);
 
       for (const device of devices) {
         this.addDevice(device);
@@ -106,6 +112,45 @@ export class BlueAirPlatform extends EventEmitter implements DynamicPlatformPlug
     } catch (error) {
       this.log.error('Error getting initial device states:', error);
     }
+  }
+
+  private regionToMqttCode(region: string): string {
+    const map: Record<string, string> = {
+      USA: 'US',
+      Australia: 'AU',
+      China: 'CN',
+      'Default (all other regions)': 'EU',
+      Russia: 'EU', // no dedicated Russia broker observed; falls back to EU per HA's mapping
+    };
+    return map[region] ?? 'EU';
+  }
+
+  private startMqtt(): void {
+    this.mqttClient = new BlueAirMqttClient(
+      this.blueAirApi,
+      this.regionToMqttCode(this.platformConfig.region),
+      this.log,
+      (deviceUuid, sensorData) => {
+        const blueAirDevice = this.devices.find((d) => d.id === deviceUuid);
+        if (!blueAirDevice) {
+          return;
+        }
+        blueAirDevice.emit('update', {
+          id: deviceUuid,
+          name: blueAirDevice.name,
+          state: {},
+          sensorData,
+        });
+      },
+    );
+
+    for (const device of this.devices) {
+      this.mqttClient!.registerDevice(device.id);
+    }
+
+    this.mqttClient.connect().catch((err) => {
+      this.log.warn(`Failed to connect MQTT client: ${err.message}`);
+    });
   }
 
   async addDevice(device: BlueAirDeviceStatus) {
